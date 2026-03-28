@@ -11,7 +11,7 @@ A lightweight macOS terminal monitor that sends you native notifications when:
 ### From source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/nudge.git
+git clone https://github.com/omar-dakalbab/nudge.git
 cd nudge
 swift build -c release
 cp .build/release/nudge /usr/local/bin/
