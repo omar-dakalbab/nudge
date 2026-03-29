@@ -1,8 +1,8 @@
 class Nudge < Formula
   desc "Terminal activity monitor - notifications for finished commands, input prompts, and Claude Code"
   homepage "https://github.com/omar-dakalbab/nudge"
-  url "https://github.com/omar-dakalbab/nudge/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "cd961b8a4383e3bedda03230906b39c2ce9a185b112bf3582e22b2798ac052cf"
+  url "https://github.com/omar-dakalbab/nudge/archive/refs/tags/v0.3.0.tar.gz"
+  sha256 "c2526e3bfcbed6d96402b3b87aace946348a9bab19041a79358e12f13f9ec89d"
   license "MIT"
   head "https://github.com/omar-dakalbab/nudge.git", branch: "main"
 
@@ -15,6 +15,6 @@ class Nudge < Formula
   end
 
   test do
-    assert_match "nudge 0.1.0", shell_output("#{bin}/nudge --version")
+    assert_match "nudge 0.3.0", shell_output("#{bin}/nudge --version")
   end
 end
