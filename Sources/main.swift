@@ -65,10 +65,10 @@ struct Config {
             switch args[i] {
             case "--interval", "-i":
                 i += 1
-                if i < args.count, let val = TimeInterval(args[i]) { config.pollInterval = val }
+                if i < args.count, let val = TimeInterval(args[i]), val >= 1, val <= 3600 { config.pollInterval = val }
             case "--threshold", "-t":
                 i += 1
-                if i < args.count, let val = TimeInterval(args[i]) { config.finishThreshold = val }
+                if i < args.count, let val = TimeInterval(args[i]), val >= 0, val <= 86400 { config.finishThreshold = val }
             case "--no-finished":
                 config.watchFinished = false
             case "--no-input":
@@ -408,11 +408,13 @@ class ProcessMonitor {
         }
 
         // Fallback: try reading the last few entries from the unified system log for this tty
+        // Sanitize tty to prevent predicate injection
+        let safeTty = tty.filter { $0.isLetter || $0.isNumber || $0 == "/" }
         let logTask = Process()
         let logPipe = Pipe()
         logTask.executableURL = URL(fileURLWithPath: "/usr/bin/log")
         logTask.arguments = ["show", "--last", "30s", "--predicate",
-                             "process == \"kernel\" AND eventMessage CONTAINS \"\(tty)\"",
+                             "process == \"kernel\" AND eventMessage CONTAINS \"\(safeTty)\"",
                              "--style", "compact"]
         logTask.standardOutput = logPipe
         logTask.standardError = FileHandle.nullDevice
@@ -448,7 +450,9 @@ class ProcessMonitor {
             guard let sessionData = try? Data(contentsOf: sessionFile),
                   let session = try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any],
                   let pid = session["pid"] as? Int,
-                  let sessionId = session["sessionId"] as? String else { continue }
+                  let sessionId = session["sessionId"] as? String,
+                  // Validate sessionId is UUID format to prevent path traversal
+                  UUID(uuidString: sessionId) != nil else { continue }
 
             // Check if this PID is still running
             guard kill(Int32(pid), 0) == 0 else { continue }
@@ -486,10 +490,11 @@ class ProcessMonitor {
         guard fileSize > 0 else { return nil }
 
         let chunkSize: UInt64 = 4096
+        let maxRead: UInt64 = 65536  // 64KB max to prevent DoS
         var offset = fileSize
         var trailingData = Data()
 
-        while offset > 0 {
+        while offset > 0 && trailingData.count < maxRead {
             let readSize = min(chunkSize, offset)
             offset -= readSize
             handle.seek(toFileOffset: offset)
@@ -763,13 +768,18 @@ class Notifier {
         #endif
     }
 
+    /// Shell-escapes a string by wrapping in single quotes and escaping internal quotes.
+    private func shellEscape(_ s: String) -> String {
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     private func runOnNotify(alert: Alert) {
         guard let onNotify = onNotify else { return }
 
         let expanded = onNotify
-            .replacingOccurrences(of: "{command}", with: alert.command)
+            .replacingOccurrences(of: "{command}", with: shellEscape(alert.command))
             .replacingOccurrences(of: "{pid}", with: "\(alert.pid)")
-            .replacingOccurrences(of: "{reason}", with: alert.reason.rawValue)
+            .replacingOccurrences(of: "{reason}", with: shellEscape(alert.reason.rawValue))
 
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/bin/sh")
