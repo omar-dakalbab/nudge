@@ -1,5 +1,8 @@
 # nudge
 
+![GitHub Downloads](https://img.shields.io/github/downloads/omar-dakalbab/nudge/total?label=downloads)
+![GitHub Stars](https://img.shields.io/github/stars/omar-dakalbab/nudge)
+
 A lightweight macOS & Linux terminal monitor that sends you native notifications when:
 
 - **A long-running command finishes** — no more staring at terminals waiting for builds
