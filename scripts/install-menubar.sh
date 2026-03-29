@@ -4,7 +4,7 @@
 
 set -e
 
-APP_NAME="Nudge"
+APP_NAME="NudgeMonitor"
 APP_DIR="$HOME/Applications/$APP_NAME.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
@@ -16,32 +16,31 @@ echo "Creating $APP_DIR..."
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS"
 
-cp .build/release/nudge "$MACOS/nudge"
-
-# Create a wrapper script that launches with --menu-bar
-cat > "$MACOS/$APP_NAME" << 'WRAPPER'
-#!/bin/bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$DIR/nudge" --menu-bar "$@"
-WRAPPER
-chmod +x "$MACOS/$APP_NAME"
+# Copy binary directly as the app executable
+cp .build/release/nudge "$MACOS/$APP_NAME"
 
 # Create Info.plist
-cat > "$CONTENTS/Info.plist" << PLIST
+cat > "$CONTENTS/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>$APP_NAME</string>
+    <string>NudgeMonitor</string>
     <key>CFBundleIdentifier</key>
-    <string>com.nudge.menubar</string>
+    <string>com.nudge-monitor.app</string>
     <key>CFBundleName</key>
-    <string>$APP_NAME</string>
+    <string>Nudge</string>
+    <key>CFBundleDisplayName</key>
+    <string>Nudge</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>0.3.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.3.0</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -51,6 +50,9 @@ cat > "$CONTENTS/Info.plist" << PLIST
 </dict>
 </plist>
 PLIST
+
+# Sign the app
+codesign --force --deep -s - "$APP_DIR" 2>/dev/null
 
 echo ""
 echo "✅ Installed $APP_DIR"

@@ -97,7 +97,7 @@ struct Config {
                 printUsage()
                 exit(0)
             case "--version":
-                print("nudge 0.1.0")
+                print("nudge 0.3.0")
                 exit(0)
             default:
                 break
@@ -716,20 +716,32 @@ class Notifier {
 
     private func sendSystemNotification(title: String, body: String) {
         #if os(macOS)
-        let soundFlag = sound ? " sound name \"Glass\"" : ""
-        let script = "display notification \"\(body)\" with title \"\(title)\"\(soundFlag)"
+        let center = UNUserNotificationCenter.current()
+        let semaphore = DispatchSemaphore(value: 0)
 
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        task.arguments = ["-e", script]
-        task.standardOutput = FileHandle.nullDevice
-        task.standardError = FileHandle.nullDevice
+        // Request permission on first use
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in
+            semaphore.signal()
+        }
+        semaphore.wait()
 
-        do {
-            try task.run()
-            task.waitUntilExit()
-        } catch {
-            fputs("Warning: Failed to send notification\n", stderr)
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        if sound {
+            content.sound = .default
+        }
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+
+        center.add(request) { error in
+            if let error = error {
+                fputs("Warning: Failed to send notification: \(error.localizedDescription)\n", stderr)
+            }
         }
         #elseif os(Linux)
         let task = Process()
@@ -830,7 +842,12 @@ class NudgeMenuBarApp: NSObject, NSApplicationDelegate {
 
 // MARK: - Main
 
-let config = Config.fromArgs(CommandLine.arguments)
+var config = Config.fromArgs(CommandLine.arguments)
+
+// Auto-enable menu bar mode when launched from a .app bundle
+if let execPath = Bundle.main.executablePath, execPath.contains(".app/Contents/MacOS") {
+    config.menuBar = true
+}
 let monitor = ProcessMonitor(config: config)
 let notifier = Notifier(sound: config.sound, onNotify: config.onNotify, smartNotify: config.smartNotify)
 
