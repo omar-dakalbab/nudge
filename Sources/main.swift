@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(NaturalLanguage)
+import NaturalLanguage
+#endif
 #if canImport(UserNotifications)
 import UserNotifications
 #endif
@@ -21,11 +24,22 @@ struct Alert: Hashable {
     let command: String
     let tty: String
     let reason: AlertReason
+    var aiSummary: String? = nil
 
     enum AlertReason: String, Hashable {
         case finished = "Command finished"
         case waitingForInput = "Waiting for input"
         case claudeCode = "Claude Code needs approval"
+    }
+
+    // Hashable conformance ignoring aiSummary
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(pid)
+        hasher.combine(reason)
+    }
+
+    static func == (lhs: Alert, rhs: Alert) -> Bool {
+        lhs.pid == rhs.pid && lhs.reason == rhs.reason
     }
 }
 
@@ -39,6 +53,7 @@ struct Config {
     var watchClaude: Bool = true
     var sound: Bool = true
     var verbose: Bool = false
+    var smartNotify: Bool = true
     var menuBar: Bool = false
     var onNotify: String? = nil
     var extraIgnored: [String] = []
@@ -62,6 +77,8 @@ struct Config {
                 config.watchClaude = false
             case "--no-sound":
                 config.sound = false
+            case "--no-ai":
+                config.smartNotify = false
             case "--verbose", "-v":
                 config.verbose = true
             case "--menu-bar":
@@ -110,6 +127,7 @@ func printUsage() {
       --no-input                 Don't watch for input-waiting processes
       --no-claude                Don't watch for Claude Code prompts
       --no-sound                 Disable notification sound
+      --no-ai                    Disable AI-powered smart notifications
       --ignore <cmd1,cmd2,...>   Additional commands to ignore
       --on-notify <cmd>          Run shell command on notification
                                  Placeholders: {command} {pid} {reason}
@@ -200,7 +218,11 @@ class ProcessMonitor {
                 if let tracked = trackedProcesses[pid] {
                     let elapsed = Date().timeIntervalSince(tracked.startTime)
                     if elapsed >= config.finishThreshold && !notifiedPids.contains(pid) {
-                        alerts.append(Alert(pid: pid, command: tracked.command, tty: tracked.tty, reason: .finished))
+                        var alert = Alert(pid: pid, command: tracked.command, tty: tracked.tty, reason: .finished)
+                        if config.smartNotify {
+                            alert.aiSummary = captureRecentOutput(tty: tracked.tty)
+                        }
+                        alerts.append(alert)
                         notifiedPids.insert(pid)
                     }
                 }
@@ -342,6 +364,70 @@ class ProcessMonitor {
         return false
     }
 
+    /// Captures recent terminal output from a tty.
+    /// Tries tmux capture-pane first, falls back to reading system log.
+    private func captureRecentOutput(tty: String) -> String? {
+        // Try tmux capture-pane if the tty belongs to a tmux session
+        let fullTty = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+
+        // First find which tmux pane owns this tty
+        let findPane = Process()
+        let findPipe = Pipe()
+        findPane.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        findPane.arguments = ["tmux", "list-panes", "-a", "-F", "#{pane_tty} #{pane_id}"]
+        findPane.standardOutput = findPipe
+        findPane.standardError = FileHandle.nullDevice
+
+        if let _ = try? findPane.run() {
+            findPane.waitUntilExit()
+            if findPane.terminationStatus == 0,
+               let output = String(data: findPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) {
+                for line in output.components(separatedBy: "\n") {
+                    let parts = line.components(separatedBy: " ")
+                    guard parts.count >= 2, parts[0] == fullTty else { continue }
+                    let paneId = parts[1]
+
+                    // Capture last 20 lines from this pane
+                    let capture = Process()
+                    let capturePipe = Pipe()
+                    capture.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                    capture.arguments = ["tmux", "capture-pane", "-t", paneId, "-p", "-S", "-20"]
+                    capture.standardOutput = capturePipe
+                    capture.standardError = FileHandle.nullDevice
+
+                    if let _ = try? capture.run() {
+                        capture.waitUntilExit()
+                        if capture.terminationStatus == 0,
+                           let captured = String(data: capturePipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+                           !captured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            return captured
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: try reading the last few entries from the unified system log for this tty
+        let logTask = Process()
+        let logPipe = Pipe()
+        logTask.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        logTask.arguments = ["show", "--last", "30s", "--predicate",
+                             "process == \"kernel\" AND eventMessage CONTAINS \"\(tty)\"",
+                             "--style", "compact"]
+        logTask.standardOutput = logPipe
+        logTask.standardError = FileHandle.nullDevice
+
+        if let _ = try? logTask.run() {
+            logTask.waitUntilExit()
+            if let output = String(data: logPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+               !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return output
+            }
+        }
+
+        return nil
+    }
+
     /// Reads ~/.claude/sessions/ to find active Claude sessions, then checks
     /// each session's JSONL conversation log to determine if Claude is waiting
     /// for tool approval (stop_reason: "tool_use") or finished (stop_reason: "end_turn").
@@ -425,25 +511,192 @@ class ProcessMonitor {
     }
 }
 
+// MARK: - AI Output Analyzer
+
+#if canImport(NaturalLanguage)
+class OutputAnalyzer {
+
+    enum ResultType: String {
+        case success = "success"
+        case failure = "failure"
+        case warning = "warning"
+        case neutral = "info"
+    }
+
+    struct Analysis {
+        let type: ResultType
+        let summary: String
+    }
+
+    // Error/failure patterns commonly seen in terminal output
+    private let failurePatterns: [(pattern: String, extract: Bool)] = [
+        ("error:", true),
+        ("Error:", true),
+        ("ERROR:", true),
+        ("fatal:", true),
+        ("FATAL:", true),
+        ("failed", false),
+        ("FAILED", false),
+        ("Cannot find", true),
+        ("No such file", true),
+        ("No such module", true),
+        ("not found", true),
+        ("Permission denied", true),
+        ("segmentation fault", false),
+        ("panic:", true),
+        ("exception:", true),
+        ("Traceback", false),
+        ("BUILD FAILED", false),
+        ("FAILURE:", true),
+        ("compilation error", false),
+        ("syntax error", true),
+        ("undefined reference", true),
+        ("cannot open", true),
+    ]
+
+    private let successPatterns: [String] = [
+        "Build complete",
+        "BUILD SUCCEEDED",
+        "BUILD SUCCESSFUL",
+        "Tests passed",
+        "All tests passed",
+        "0 failures",
+        "0 errors",
+        "Successfully",
+        "Done in",
+        "Finished in",
+        "completed successfully",
+        "deployed",
+        "installed",
+        "up to date",
+    ]
+
+    private let warningPatterns: [String] = [
+        "warning:",
+        "Warning:",
+        "WARNING:",
+        "deprecated",
+        "DEPRECATED",
+    ]
+
+    /// Analyzes terminal output text and produces a short, smart summary.
+    func analyze(output: String, command: String) -> Analysis {
+        let lines = output.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        // 1. Check for failure patterns — extract the key error line
+        for line in lines.reversed() {
+            for (pattern, extract) in failurePatterns {
+                if line.localizedCaseInsensitiveContains(pattern) {
+                    let summary = extract ? extractMessage(from: line, marker: pattern) : line
+                    return Analysis(type: .failure, summary: truncate("\(command) failed: \(summary)"))
+                }
+            }
+        }
+
+        // 2. Check for success patterns
+        for line in lines.reversed() {
+            for pattern in successPatterns {
+                if line.localizedCaseInsensitiveContains(pattern) {
+                    return Analysis(type: .success, summary: truncate("\(command) succeeded: \(line)"))
+                }
+            }
+        }
+
+        // 3. Check for warnings
+        for line in lines.reversed() {
+            for pattern in warningPatterns {
+                if line.localizedCaseInsensitiveContains(pattern) {
+                    let msg = extractMessage(from: line, marker: pattern)
+                    return Analysis(type: .warning, summary: truncate("\(command) warning: \(msg)"))
+                }
+            }
+        }
+
+        // 4. Use NaturalLanguage sentiment as a fallback
+        let lastLines = lines.suffix(5).joined(separator: " ")
+        let sentiment = analyzeSentiment(lastLines)
+
+        if sentiment < -0.3 {
+            let lastMeaningful = lines.last ?? "finished with issues"
+            return Analysis(type: .failure, summary: truncate("\(command): \(lastMeaningful)"))
+        } else if sentiment > 0.3 {
+            return Analysis(type: .success, summary: truncate("\(command) completed successfully"))
+        }
+
+        return Analysis(type: .neutral, summary: truncate("\(command) has completed"))
+    }
+
+    /// Uses Apple's NLTagger to get sentiment score (-1.0 to 1.0).
+    private func analyzeSentiment(_ text: String) -> Double {
+        let tagger = NLTagger(tagSchemes: [.sentimentScore])
+        tagger.string = text
+        let (tag, _) = tagger.tag(at: text.startIndex, unit: .paragraph, scheme: .sentimentScore)
+        return Double(tag?.rawValue ?? "0") ?? 0.0
+    }
+
+    /// Extracts the meaningful part of an error line after a marker.
+    private func extractMessage(from line: String, marker: String) -> String {
+        if let range = line.range(of: marker, options: .caseInsensitive) {
+            let after = line[range.upperBound...].trimmingCharacters(in: .whitespaces)
+            if !after.isEmpty { return String(after) }
+        }
+        return line
+    }
+
+    private func truncate(_ text: String, maxLength: Int = 120) -> String {
+        if text.count <= maxLength { return text }
+        return String(text.prefix(maxLength - 3)) + "..."
+    }
+}
+#endif
+
 // MARK: - Notifier
 
 class Notifier {
     private let sound: Bool
     private let onNotify: String?
+    private let smartNotify: Bool
+    #if canImport(NaturalLanguage)
+    private let analyzer = OutputAnalyzer()
+    #endif
 
-    init(sound: Bool, onNotify: String? = nil) {
+    init(sound: Bool, onNotify: String? = nil, smartNotify: Bool = true) {
         self.sound = sound
         self.onNotify = onNotify
+        self.smartNotify = smartNotify
     }
 
     func send(alert: Alert) {
-        let title: String
+        var title: String
         var body: String
 
         switch alert.reason {
         case .finished:
+            #if canImport(NaturalLanguage)
+            if smartNotify, let aiSummary = alert.aiSummary {
+                // Use AI-analyzed output
+                let analysis = analyzer.analyze(output: aiSummary, command: alert.command)
+                switch analysis.type {
+                case .success:
+                    title = "✅ \(alert.command)"
+                case .failure:
+                    title = "❌ \(alert.command)"
+                case .warning:
+                    title = "⚠️ \(alert.command)"
+                case .neutral:
+                    title = "⚡ \(alert.command)"
+                }
+                body = analysis.summary
+            } else {
+                title = "⚡ Command Finished"
+                body = "\(alert.command) has completed"
+            }
+            #else
             title = "⚡ Command Finished"
             body = "\(alert.command) has completed"
+            #endif
         case .waitingForInput:
             title = "✋ Input Needed"
             body = "\(alert.command) is waiting for your input"
@@ -579,7 +832,7 @@ class NudgeMenuBarApp: NSObject, NSApplicationDelegate {
 
 let config = Config.fromArgs(CommandLine.arguments)
 let monitor = ProcessMonitor(config: config)
-let notifier = Notifier(sound: config.sound, onNotify: config.onNotify)
+let notifier = Notifier(sound: config.sound, onNotify: config.onNotify, smartNotify: config.smartNotify)
 
 if config.menuBar {
     #if canImport(AppKit)
@@ -596,7 +849,7 @@ if config.menuBar {
     print("""
     🔔 nudge is running
        Polling every \(Int(config.pollInterval))s | Finish threshold: \(Int(config.finishThreshold))s
-       Watching: \(config.watchFinished ? "✓" : "✗") finished  \(config.watchInput ? "✓" : "✗") input  \(config.watchClaude ? "✓" : "✗") claude
+       Watching: \(config.watchFinished ? "✓" : "✗") finished  \(config.watchInput ? "✓" : "✗") input  \(config.watchClaude ? "✓" : "✗") claude  \(config.smartNotify ? "✓" : "✗") AI
        Press Ctrl+C to stop
     """)
 

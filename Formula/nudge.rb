@@ -2,7 +2,7 @@ class Nudge < Formula
   desc "Terminal activity monitor - notifications for finished commands, input prompts, and Claude Code"
   homepage "https://github.com/omar-dakalbab/nudge"
   url "https://github.com/omar-dakalbab/nudge/archive/refs/tags/v0.1.0.tar.gz"
-  sha256 "PLACEHOLDER"
+  sha256 "cd961b8a4383e3bedda03230906b39c2ce9a185b112bf3582e22b2798ac052cf"
   license "MIT"
   head "https://github.com/omar-dakalbab/nudge.git", branch: "main"
 

@@ -17,9 +17,10 @@ swift build -c release
 cp .build/release/nudge /usr/local/bin/
 ```
 
-### Homebrew (coming soon)
+### Homebrew
 
 ```bash
+brew tap omar-dakalbab/nudge
 brew install nudge
 ```
 
