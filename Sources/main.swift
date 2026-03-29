@@ -1,5 +1,10 @@
 import Foundation
+#if canImport(UserNotifications)
 import UserNotifications
+#endif
+#if canImport(AppKit)
+import AppKit
+#endif
 
 // MARK: - Models
 
@@ -13,6 +18,8 @@ struct TerminalProcess {
 
 struct Alert: Hashable {
     let pid: Int32
+    let command: String
+    let tty: String
     let reason: AlertReason
 
     enum AlertReason: String, Hashable {
@@ -32,6 +39,9 @@ struct Config {
     var watchClaude: Bool = true
     var sound: Bool = true
     var verbose: Bool = false
+    var menuBar: Bool = false
+    var onNotify: String? = nil
+    var extraIgnored: [String] = []
 
     static func fromArgs(_ args: [String]) -> Config {
         var config = Config()
@@ -54,6 +64,18 @@ struct Config {
                 config.sound = false
             case "--verbose", "-v":
                 config.verbose = true
+            case "--menu-bar":
+                config.menuBar = true
+            case "--on-notify":
+                i += 1
+                if i < args.count { config.onNotify = args[i] }
+            case "--ignore":
+                i += 1
+                if i < args.count {
+                    config.extraIgnored = args[i].components(separatedBy: ",").map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }
+                }
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -71,9 +93,9 @@ struct Config {
 
 func printUsage() {
     print("""
-    nudge - Terminal activity monitor for macOS
+    nudge - Terminal activity monitor for macOS & Linux
 
-    Watches your terminal sessions and sends native macOS notifications when:
+    Watches your terminal sessions and sends native notifications when:
       • A long-running command finishes
       • A process is waiting for input (sudo, password, y/n)
       • Claude Code or AI agents need approval
@@ -82,20 +104,27 @@ func printUsage() {
       nudge [OPTIONS]
 
     OPTIONS:
-      -i, --interval <secs>   Poll interval in seconds (default: 5)
-      -t, --threshold <secs>  Min runtime to notify on finish (default: 30)
-      --no-finished           Don't watch for finished commands
-      --no-input              Don't watch for input-waiting processes
-      --no-claude             Don't watch for Claude Code prompts
-      --no-sound              Disable notification sound
-      -v, --verbose           Print debug info
-      -h, --help              Show this help
-      --version               Show version
+      -i, --interval <secs>      Poll interval in seconds (default: 5)
+      -t, --threshold <secs>     Min runtime to notify on finish (default: 30)
+      --no-finished              Don't watch for finished commands
+      --no-input                 Don't watch for input-waiting processes
+      --no-claude                Don't watch for Claude Code prompts
+      --no-sound                 Disable notification sound
+      --ignore <cmd1,cmd2,...>   Additional commands to ignore
+      --on-notify <cmd>          Run shell command on notification
+                                 Placeholders: {command} {pid} {reason}
+      --menu-bar                 Run as macOS menu bar app (macOS only)
+      -v, --verbose              Print debug info
+      -h, --help                 Show this help
+      --version                  Show version
 
     EXAMPLES:
-      nudge                   Start with defaults
-      nudge -i 3 -t 10       Poll every 3s, notify for commands > 10s
-      nudge --no-finished     Only watch for input prompts
+      nudge                              Start with defaults
+      nudge -i 3 -t 10                  Poll every 3s, notify for commands > 10s
+      nudge --no-finished                Only watch for input prompts
+      nudge --ignore python,ruby         Also ignore python and ruby processes
+      nudge --on-notify 'say {command}'  Speak the command name on notification
+      nudge --menu-bar                   Run in the macOS menu bar
 
     INSTALL:
       brew install nudge      (coming soon)
@@ -105,20 +134,57 @@ func printUsage() {
     """)
 }
 
+// MARK: - Session Name Detection (tmux / iTerm2)
+
+func sessionName(forTty tty: String) -> String? {
+    // Try tmux: list all panes with their ttys and session:window names
+    let task = Process()
+    let pipe = Pipe()
+    task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+    task.arguments = ["tmux", "list-panes", "-a", "-F", "#{pane_tty} #{session_name}:#{window_name}"]
+    task.standardOutput = pipe
+    task.standardError = FileHandle.nullDevice
+
+    do {
+        try task.run()
+        task.waitUntilExit()
+    } catch {
+        return nil
+    }
+
+    guard task.terminationStatus == 0 else { return nil }
+
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8) else { return nil }
+
+    // tty from ps is like "ttys003", tmux reports "/dev/ttys003"
+    let fullTty = tty.hasPrefix("/dev/") ? tty : "/dev/\(tty)"
+
+    for line in output.components(separatedBy: "\n") {
+        let parts = line.components(separatedBy: " ")
+        guard parts.count >= 2 else { continue }
+        if parts[0] == fullTty {
+            return parts.dropFirst().joined(separator: " ")
+        }
+    }
+
+    return nil
+}
+
 // MARK: - Process Monitor
 
 class ProcessMonitor {
-    private var trackedProcesses: [Int32: (command: String, startTime: Date)] = [:]
+    private var trackedProcesses: [Int32: (command: String, tty: String, startTime: Date)] = [:]
     private var notifiedPids: Set<Int32> = []
     private var previousPids: Set<Int32> = []
+    private var claudeLastState: [Int32: String] = [:]  // track last known state per Claude PID
     private let config: Config
 
     init(config: Config) {
         self.config = config
-        // Snapshot current processes so we don't alert on pre-existing ones
         previousPids = Set(getTerminalProcesses().map { $0.pid })
         for proc in getTerminalProcesses() {
-            trackedProcesses[proc.pid] = (proc.command, Date())
+            trackedProcesses[proc.pid] = (proc.command, proc.tty, Date())
         }
     }
 
@@ -134,7 +200,7 @@ class ProcessMonitor {
                 if let tracked = trackedProcesses[pid] {
                     let elapsed = Date().timeIntervalSince(tracked.startTime)
                     if elapsed >= config.finishThreshold && !notifiedPids.contains(pid) {
-                        alerts.append(Alert(pid: pid, reason: .finished))
+                        alerts.append(Alert(pid: pid, command: tracked.command, tty: tracked.tty, reason: .finished))
                         notifiedPids.insert(pid)
                     }
                 }
@@ -145,7 +211,7 @@ class ProcessMonitor {
         // Track new processes
         for proc in currentProcesses {
             if trackedProcesses[proc.pid] == nil {
-                trackedProcesses[proc.pid] = (proc.command, Date())
+                trackedProcesses[proc.pid] = (proc.command, proc.tty, Date())
             }
         }
 
@@ -153,19 +219,30 @@ class ProcessMonitor {
         if config.watchInput {
             for proc in currentProcesses {
                 if isWaitingForInput(proc) && !notifiedPids.contains(proc.pid) {
-                    alerts.append(Alert(pid: proc.pid, reason: .waitingForInput))
+                    alerts.append(Alert(pid: proc.pid, command: proc.command, tty: proc.tty, reason: .waitingForInput))
                     notifiedPids.insert(proc.pid)
                 }
             }
         }
 
-        // Check for Claude Code waiting
+        // Check Claude Code sessions by reading conversation state
         if config.watchClaude {
-            for proc in currentProcesses {
-                if isClaudeWaiting(proc) && !notifiedPids.contains(proc.pid) {
-                    alerts.append(Alert(pid: proc.pid, reason: .claudeCode))
-                    notifiedPids.insert(proc.pid)
+            let claudeStates = getClaudeSessionStates()
+            var activeClaudePids: Set<Int32> = []
+            for (pid, state) in claudeStates {
+                activeClaudePids.insert(pid)
+                let prevState = claudeLastState[pid]
+                claudeLastState[pid] = state
+
+                // Only notify on transition TO a waiting state
+                if prevState != nil && prevState != state {
+                    if state == "tool_use" {
+                        alerts.append(Alert(pid: pid, command: "claude", tty: "", reason: .claudeCode))
+                    }
                 }
+            }
+            for pid in Array(claudeLastState.keys) where !activeClaudePids.contains(pid) {
+                claudeLastState.removeValue(forKey: pid)
             }
         }
 
@@ -195,12 +272,13 @@ class ProcessMonitor {
         guard let output = String(data: data, encoding: .utf8) else { return [] }
 
         var processes: [TerminalProcess] = []
-        let lines = output.components(separatedBy: "\n").dropFirst() // skip header
+        let lines = output.components(separatedBy: "\n").dropFirst()
 
-        let ignoredCommands: Set<String> = [
+        var ignoredCommands: Set<String> = [
             "zsh", "bash", "fish", "login", "sshd", "tmux", "screen",
             "nudge", "ps", "wc", "grep", "awk", "sed", "cat", "head", "tail"
         ]
+        ignoredCommands.formUnion(config.extraIgnored)
 
         for line in lines {
             let parts = line.trimmingCharacters(in: .whitespaces)
@@ -230,7 +308,6 @@ class ProcessMonitor {
     }
 
     private func isWaitingForInput(_ proc: TerminalProcess) -> Bool {
-        // Check wchan (wait channel) for the process
         let task = Process()
         let pipe = Pipe()
         task.executableURL = URL(fileURLWithPath: "/bin/ps")
@@ -265,34 +342,86 @@ class ProcessMonitor {
         return false
     }
 
-    private func isClaudeWaiting(_ proc: TerminalProcess) -> Bool {
-        let claudeNames: Set<String> = ["claude", "claude-code", "node"]
-        guard claudeNames.contains(proc.command) else { return false }
+    /// Reads ~/.claude/sessions/ to find active Claude sessions, then checks
+    /// each session's JSONL conversation log to determine if Claude is waiting
+    /// for tool approval (stop_reason: "tool_use") or finished (stop_reason: "end_turn").
+    /// Returns a dictionary of [PID: lastStopReason].
+    private func getClaudeSessionStates() -> [Int32: String] {
+        var states: [Int32: String] = [:]
+        let homeDir = FileManager.default.homeDirectoryForCurrentUser
+        let sessionsDir = homeDir.appendingPathComponent(".claude/sessions")
+        let projectsDir = homeDir.appendingPathComponent(".claude/projects")
 
-        // Check if Claude process has been idle (low CPU in S state)
-        if proc.state.hasPrefix("S") {
-            // Further verify by checking the process command line
-            let task = Process()
-            let pipe = Pipe()
-            task.executableURL = URL(fileURLWithPath: "/bin/ps")
-            task.arguments = ["-o", "args=", "-p", "\(proc.pid)"]
-            task.standardOutput = pipe
-            task.standardError = FileHandle.nullDevice
+        guard let sessionFiles = try? FileManager.default.contentsOfDirectory(
+            at: sessionsDir, includingPropertiesForKeys: nil
+        ) else { return states }
 
-            do {
-                try task.run()
-                task.waitUntilExit()
-            } catch {
-                return false
+        for sessionFile in sessionFiles {
+            guard sessionFile.pathExtension == "json" else { continue }
+
+            guard let sessionData = try? Data(contentsOf: sessionFile),
+                  let session = try? JSONSerialization.jsonObject(with: sessionData) as? [String: Any],
+                  let pid = session["pid"] as? Int,
+                  let sessionId = session["sessionId"] as? String else { continue }
+
+            // Check if this PID is still running
+            guard kill(Int32(pid), 0) == 0 else { continue }
+
+            // Find the JSONL file for this session across all project dirs
+            guard let projectDirs = try? FileManager.default.contentsOfDirectory(
+                at: projectsDir, includingPropertiesForKeys: nil
+            ) else { continue }
+
+            for projectDir in projectDirs {
+                let jsonlFile = projectDir.appendingPathComponent("\(sessionId).jsonl")
+                guard FileManager.default.fileExists(atPath: jsonlFile.path) else { continue }
+
+                // Read the last line of the JSONL to get the most recent message
+                if let lastLine = lastLineOf(file: jsonlFile),
+                   let lineData = lastLine.data(using: .utf8),
+                   let entry = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                   let type = entry["type"] as? String, type == "assistant",
+                   let message = entry["message"] as? [String: Any],
+                   let stopReason = message["stop_reason"] as? String {
+                    states[Int32(pid)] = stopReason
+                }
+                break
             }
-
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            let args = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-            return args.lowercased().contains("claude")
         }
-        return false
+        return states
+    }
+
+    /// Efficiently reads the last line of a file without loading the entire file.
+    private func lastLineOf(file: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { handle.closeFile() }
+
+        let fileSize = handle.seekToEndOfFile()
+        guard fileSize > 0 else { return nil }
+
+        let chunkSize: UInt64 = 4096
+        var offset = fileSize
+        var trailingData = Data()
+
+        while offset > 0 {
+            let readSize = min(chunkSize, offset)
+            offset -= readSize
+            handle.seek(toFileOffset: offset)
+            let chunk = handle.readData(ofLength: Int(readSize))
+            trailingData = chunk + trailingData
+
+            if let str = String(data: trailingData, encoding: .utf8) {
+                let lines = str.components(separatedBy: "\n").filter { !$0.isEmpty }
+                if lines.count >= 1 {
+                    return lines.last
+                }
+            }
+        }
+
+        if let str = String(data: trailingData, encoding: .utf8) {
+            return str.components(separatedBy: "\n").filter { !$0.isEmpty }.last
+        }
+        return nil
     }
 }
 
@@ -300,27 +429,40 @@ class ProcessMonitor {
 
 class Notifier {
     private let sound: Bool
+    private let onNotify: String?
 
-    init(sound: Bool) {
+    init(sound: Bool, onNotify: String? = nil) {
         self.sound = sound
+        self.onNotify = onNotify
     }
 
     func send(alert: Alert) {
         let title: String
-        let body: String
+        var body: String
 
         switch alert.reason {
         case .finished:
             title = "⚡ Command Finished"
-            body = "Process \(alert.pid) has completed"
+            body = "\(alert.command) has completed"
         case .waitingForInput:
             title = "✋ Input Needed"
-            body = "Process \(alert.pid) is waiting for your input"
+            body = "\(alert.command) is waiting for your input"
         case .claudeCode:
             title = "🤖 Claude Code"
-            body = "An agent needs your approval (PID \(alert.pid))"
+            body = "Claude Code needs your approval"
         }
 
+        // Append tmux/iTerm2 session name if available
+        if let session = sessionName(forTty: alert.tty) {
+            body += " [\(session)]"
+        }
+
+        sendSystemNotification(title: title, body: body)
+        runOnNotify(alert: alert)
+    }
+
+    private func sendSystemNotification(title: String, body: String) {
+        #if os(macOS)
         let soundFlag = sound ? " sound name \"Glass\"" : ""
         let script = "display notification \"\(body)\" with title \"\(title)\"\(soundFlag)"
 
@@ -336,35 +478,142 @@ class Notifier {
         } catch {
             fputs("Warning: Failed to send notification\n", stderr)
         }
+        #elseif os(Linux)
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/notify-send")
+        var args = [title, body]
+        if !sound {
+            args.append(contentsOf: ["-h", "string:suppress-sound:true"])
+        }
+        task.arguments = args
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+
+        do {
+            try task.run()
+            task.waitUntilExit()
+        } catch {
+            fputs("Warning: Failed to send notification (is notify-send installed?)\n", stderr)
+        }
+        #endif
+    }
+
+    private func runOnNotify(alert: Alert) {
+        guard let onNotify = onNotify else { return }
+
+        let expanded = onNotify
+            .replacingOccurrences(of: "{command}", with: alert.command)
+            .replacingOccurrences(of: "{pid}", with: "\(alert.pid)")
+            .replacingOccurrences(of: "{reason}", with: alert.reason.rawValue)
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/sh")
+        task.arguments = ["-c", expanded]
+        task.standardOutput = FileHandle.nullDevice
+        task.standardError = FileHandle.nullDevice
+
+        do {
+            try task.run()
+        } catch {
+            fputs("Warning: Failed to run on-notify command\n", stderr)
+        }
     }
 }
+
+// MARK: - Menu Bar App (macOS only)
+
+#if canImport(AppKit)
+class NudgeMenuBarApp: NSObject, NSApplicationDelegate {
+    var statusItem: NSStatusItem!
+    var timer: Timer!
+    let monitor: ProcessMonitor
+    let notifier: Notifier
+    let config: Config
+    private let alertCountItem = NSMenuItem(title: "Alerts sent: 0", action: nil, keyEquivalent: "")
+    private var alertCount = 0
+
+    init(config: Config, monitor: ProcessMonitor, notifier: Notifier) {
+        self.config = config
+        self.monitor = monitor
+        self.notifier = notifier
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.title = "🔔"
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "nudge running", action: nil, keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Polling every \(Int(config.pollInterval))s", action: nil, keyEquivalent: ""))
+        menu.addItem(alertCountItem)
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
+        statusItem.menu = menu
+
+        timer = Timer.scheduledTimer(withTimeInterval: config.pollInterval, repeats: true) { [weak self] _ in
+            self?.pollAndNotify()
+        }
+    }
+
+    @objc private func quit() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    private func pollAndNotify() {
+        let alerts = monitor.poll()
+        for alert in alerts {
+            if config.verbose {
+                let ts = ISO8601DateFormatter().string(from: Date())
+                print("[\(ts)] \(alert.reason.rawValue) — PID \(alert.pid)")
+            }
+            notifier.send(alert: alert)
+            alertCount += 1
+        }
+        alertCountItem.title = "Alerts sent: \(alertCount)"
+    }
+}
+#endif
 
 // MARK: - Main
 
 let config = Config.fromArgs(CommandLine.arguments)
 let monitor = ProcessMonitor(config: config)
-let notifier = Notifier(sound: config.sound)
+let notifier = Notifier(sound: config.sound, onNotify: config.onNotify)
 
-print("""
-🔔 nudge is running
-   Polling every \(Int(config.pollInterval))s | Finish threshold: \(Int(config.finishThreshold))s
-   Watching: \(config.watchFinished ? "✓" : "✗") finished  \(config.watchInput ? "✓" : "✗") input  \(config.watchClaude ? "✓" : "✗") claude
-   Press Ctrl+C to stop
-""")
+if config.menuBar {
+    #if canImport(AppKit)
+    let app = NSApplication.shared
+    let delegate = NudgeMenuBarApp(config: config, monitor: monitor, notifier: notifier)
+    app.delegate = delegate
+    app.setActivationPolicy(.accessory)
+    app.run()
+    #else
+    fputs("Error: --menu-bar requires macOS\n", stderr)
+    exit(1)
+    #endif
+} else {
+    print("""
+    🔔 nudge is running
+       Polling every \(Int(config.pollInterval))s | Finish threshold: \(Int(config.finishThreshold))s
+       Watching: \(config.watchFinished ? "✓" : "✗") finished  \(config.watchInput ? "✓" : "✗") input  \(config.watchClaude ? "✓" : "✗") claude
+       Press Ctrl+C to stop
+    """)
 
-signal(SIGINT) { _ in
-    print("\n👋 nudge stopped")
-    exit(0)
-}
-
-while true {
-    let alerts = monitor.poll()
-    for alert in alerts {
-        if config.verbose {
-            let ts = ISO8601DateFormatter().string(from: Date())
-            print("[\(ts)] \(alert.reason.rawValue) — PID \(alert.pid)")
-        }
-        notifier.send(alert: alert)
+    signal(SIGINT) { _ in
+        print("\n👋 nudge stopped")
+        exit(0)
     }
-    Thread.sleep(forTimeInterval: config.pollInterval)
+
+    while true {
+        let alerts = monitor.poll()
+        for alert in alerts {
+            if config.verbose {
+                let ts = ISO8601DateFormatter().string(from: Date())
+                print("[\(ts)] \(alert.reason.rawValue) — PID \(alert.pid)")
+            }
+            notifier.send(alert: alert)
+        }
+        Thread.sleep(forTimeInterval: config.pollInterval)
+    }
 }
